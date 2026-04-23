@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository_owner }}
+  IMAGE_PREFIX: ${{ github.repository_owner | lower }}
 
 jobs:
   lint:
@@ -30,10 +30,9 @@ jobs:
         service: [api, worker, frontend]
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to GHCR
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -47,7 +46,7 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Vulnerability scan
+      - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }}'
@@ -61,57 +60,74 @@ jobs:
     needs: build-and-scan
     steps:
       - uses: actions/checkout@v4
-      - name: Login to GHCR
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Prepare environment
+      - name: Prepare environment for Compose
         run: echo "REDIS_PASSWORD=testpass123" > .env
-      - name: Start services
+      - name: Start full stack
         run: docker compose up -d
-      - name: Wait for healthy state
+      - name: Wait for all services to be healthy
         run: |
           for i in $(seq 1 30); do
             if docker compose ps | grep -q "(healthy)"; then
               echo "All services healthy"
               break
             fi
+            echo "Waiting for services... ($i/30)"
             sleep 10
           done
       - name: Verify end-to-end job flow
         run: |
           RESP=$(curl -s -X POST http://localhost:3000/submit)
-          ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "Submit response: $RESP"
+          ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null)
+          if [ -z "$ID" ]; then
+            echo "Failed to extract job_id from: $RESP"
+            exit 1
+          fi
+          echo "🔍 Tracking job: $ID"
           sleep 5
           STATUS=$(curl -s http://localhost:3000/status/$ID)
-          echo "$STATUS" | grep -q '"status":"completed"' || (echo "Flow failed: $STATUS" && exit 1)
-      - name: Cleanup
+          echo "Status response: $STATUS"
+          echo "$STATUS" | grep -q '"status":"completed"' || (echo "Job not completed: $STATUS" && exit 1)
+          echo "End-to-end job flow succeeded"
+      - name: Cleanup containers
         if: always()
         run: docker compose down
 
   deploy:
     runs-on: ubuntu-latest
     needs: integration
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
-      - name: Login to GHCR
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Tag images as latest
+      - name: Tag verified images as latest
         run: |
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/api:${{ github.sha }}
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/api:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/api:latest
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/api:latest
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/worker:${{ github.sha }}
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/worker:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/worker:latest
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/worker:latest
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:${{ github.sha }}
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:latest
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:latest
+          for service in api worker frontend; do
+            SHA_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:${{ github.sha }}"
+            LATEST_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:latest"
+            echo "Pulling verified image: $SHA_TAG"
+            docker pull "$SHA_TAG"
+            echo "Tagging as latest: $LATEST_TAG"
+            docker tag "$SHA_TAG" "$LATEST_TAG"
+            echo "Pushing latest tag"
+            docker push "$LATEST_TAG"
+          done
       - name: Deployment summary
-        run: echo "Images tagged as latest and ready for production pull."
+        run: |
+          echo "Deployment artifacts ready"
+          echo ""
+          echo "Images published to GitHub Container Registry:"
+          for service in api worker frontend; do
+            echo "  - ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:${{ github.sha }}"
+            echo "  - ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:latest"
+          done
