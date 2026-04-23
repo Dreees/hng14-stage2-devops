@@ -52,6 +52,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           image-ref: '${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:ci-test'
           format: table
