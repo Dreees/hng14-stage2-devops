@@ -268,47 +268,35 @@ jobs:
 
       - name: Create .env file
         run: |
-          cat > .env << ENVEOF
-          REDIS_HOST=redis
-          REDIS_PORT=6379
-          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD || 'testpassword123' }}
-          API_PORT=8000
-          FRONTEND_PORT=3000
-          FRONTEND_CONTAINER_PORT=3000
-          API_URL=http://api:8000
-          APP_ENV=production
-          ENVEOF
+          echo "REDIS_HOST=redis" > .env
+          echo "REDIS_PORT=6379" >> .env
+          echo "REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}" >> .env
+          echo "API_PORT=8000" >> .env
+          echo "FRONTEND_PORT=3000" >> .env
+          echo "FRONTEND_CONTAINER_PORT=3000" >> .env
+          echo "API_URL=http://api:8000" >> .env
+          echo "APP_ENV=production" >> .env
 
       - name: Start full stack
         run: docker compose up -d --no-build
 
       - name: Wait for all services to be healthy
         run: |
-          echo "Waiting for services..."
-          timeout 120 bash -c '
-            while true; do
-              COUNT=$(docker compose ps --format json 2>/dev/null \
-                | python3 -c "
-import sys, json
-count = 0
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-        if d.get(\"Health\") == \"healthy\":
-            count += 1
-    except:
-        pass
-print(count)
-" 2>/dev/null || echo "0")
-              echo "Healthy: $COUNT/4"
-              [ "$COUNT" = "4" ] && break
-              sleep 5
-            done
-          '
-          echo "All services healthy"
+          echo "Waiting for services to become healthy..."
+          WAITED=0
+          while [ $WAITED -lt 120 ]; do
+            HEALTHY=$(docker compose ps | grep -c "healthy" || true)
+            echo "Healthy services: $HEALTHY / 4"
+            if [ "$HEALTHY" -ge 4 ]; then
+              echo "All services healthy"
+              exit 0
+            fi
+            sleep 5
+            WAITED=$((WAITED + 5))
+          done
+          echo "Services did not become healthy in time"
+          docker compose ps
+          exit 1
 
       - name: Run integration test script
         run: |
@@ -369,7 +357,7 @@ print(count)
               if [ "$HEALTHY" = "true" ]; then
                 echo "$SERVICE deployed successfully"
               else
-                echo "$SERVICE failed health check — aborting"
+                echo "$SERVICE failed health check - aborting"
                 exit 1
               fi
             }
