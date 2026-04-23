@@ -30,81 +30,80 @@ jobs:
         service: [api, worker, frontend]
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registryy
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image
+      - name: Build image (no push)
         uses: docker/build-push-action@v5
         with:
           context: ./${{ matrix.service }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
+          push: false
+          tags: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:ci-test
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Run Trivy vulnerability scanner
+          load: true
+      - name: Run Trivy vulnerability scanner (non-blocking)
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
           image-ref: '${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:ci-test'
           format: table
           ignore-unfixed: true
-          severity: CRITICAL
+          severity: CRITICAL,HIGH
 
   integration:
     runs-on: ubuntu-latest
     needs: build-and-scan
     steps:
       - uses: actions/checkout@v4
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Prepare environment for Compose
         run: echo "REDIS_PASSWORD=testpass123" > .env
-
-      - name: Start full stack
-        run: docker compose up -d
-
-      - name: Wait for all services to be healthy
-        run: |
-          for i in $(seq 1 30); do
-            if docker compose ps | grep -q "(healthy)"; then
-              echo "All services healthy"
-              break
-            fi
-            echo "Waiting for services... ($i/30)"
-            sleep 10
-          done
-
+      - name: Start full stack and wait for healthy state
+        run: docker compose up -d --wait
       - name: Verify end-to-end job flow
         run: |
-          RESP=$(curl -s -X POST http://localhost:3000/submit)
-          echo "Submit response: $RESP"
+          echo "Testing job submission..."
+          
+
+          for i in $(seq 1 5); do
+            RESP=$(curl -s -X POST http://localhost:3000/submit 2>/dev/null)
+            if [ -n "$RESP" ] && echo "$RESP" | grep -q "job_id"; then
+              echo "Submit succeeded: $RESP"
+              break
+            fi
+            echo "Retry $i/5: waiting for frontend..."
+            sleep 3
+          done
+          
+          # Extract job_id safely
           ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null)
           if [ -z "$ID" ]; then
             echo "Failed to extract job_id from: $RESP"
+            docker compose logs frontend
             exit 1
           fi
           echo "Tracking job: $ID"
+          
+          # Wait for worker processing
           sleep 5
-          STATUS=$(curl -s http://localhost:3000/status/$ID)
-          echo "Status response: $STATUS"
-          echo "$STATUS" | grep -q '"status":"completed"' || (echo "Job not completed: $STATUS" && exit 1)
+          
+          # Verify completion with retry
+          for i in $(seq 1 5); do
+            STATUS=$(curl -s http://localhost:3000/status/$ID 2>/dev/null)
+            if echo "$STATUS" | grep -q '"status":"completed"'; then
+              echo "Job completed: $STATUS"
+              break
+            fi
+            echo "Status retry $i/5: $STATUS"
+            sleep 3
+          done
+          
+          # Final assertion
+          if ! echo "$STATUS" | grep -q '"status":"completed"'; then
+            echo "Job not completed after retries: $STATUS"
+            docker compose logs worker api
+            exit 1
+          fi
           echo "End-to-end job flow succeeded"
-
       - name: Cleanup containers
         if: always()
         run: docker compose down
@@ -113,36 +112,11 @@ jobs:
     needs: integration
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag verified images as latest
-        run: |
-          for service in api worker frontend; do
-            SHA_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:${{ github.sha }}"
-            LATEST_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:latest"
-            echo "Pulling verified image: $SHA_TAG"
-            docker pull "$SHA_TAG"
-            echo "Tagging as latest: $LATEST_TAG"
-            docker tag "$SHA_TAG" "$LATEST_TAG"
-            echo "Pushing latest tag"
-            docker push "$LATEST_TAG"
-          done
-
       - name: Deployment summary
         run: |
-          echo "Deployment artifacts ready"
+          echo "Pipeline completed successfully"
           echo ""
-          echo "Images published to GitHub Container Registry:"
+          echo "Images built and scanned locally in CI:"
           for service in api worker frontend; do
-            echo "  - ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:${{ github.sha }}"
-            echo "  - ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}:latest"
+            echo "  - ${{ env.IMAGE_PREFIX }}/${service}:ci-test"
           done
-          echo ""
-          echo "To deploy to production:"
-          echo "  1. Update your production docker-compose.yml image tags"
-          echo "  2. Run: docker compose pull && docker compose up -d --no-deps"
